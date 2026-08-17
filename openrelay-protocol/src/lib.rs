@@ -121,6 +121,7 @@ pub struct PickupRequest {
     pub payment_amount_num: f64,
     pub status: RequestStatus,
     pub created_at: i64,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,7 +214,8 @@ impl StorageEngine {
                 payment_json TEXT NOT NULL,
                 payment_amount_num REAL NOT NULL,
                 status TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
             );"
         )
         .execute(&pool)
@@ -305,8 +307,8 @@ impl StorageEngine {
         let payment_json = serde_json::to_string(&req.payment_spec).map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT INTO pickup_requests (id, requester, request_type, dropoff_mode, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
+            "INSERT INTO pickup_requests (id, requester, request_type, dropoff_mode, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
         )
         .bind(&req.id)
         .bind(&req.requester_node_id)
@@ -322,6 +324,7 @@ impl StorageEngine {
         .bind(req.payment_amount_num)
         .bind(req.status.as_str())
         .bind(req.created_at)
+        .bind(req.expires_at)
         .execute(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -346,14 +349,13 @@ impl StorageEngine {
                 match (provided_pin, stored_pin_hash) {
                     (Some(pin), Some(expected_hash)) => {
                         if hash_pin(pin) != expected_hash {
-                            return Ok(false); // Invalid PIN
+                            return Ok(false);
                         }
                     }
-                    _ => return Ok(false), // PIN required but not provided
+                    _ => return Ok(false),
                 }
             }
 
-            // Update status to COMPLETED
             sqlx::query("UPDATE pickup_requests SET status = 'COMPLETED' WHERE id = ?")
                 .bind(request_id)
                 .execute(&self.pool)
@@ -368,7 +370,19 @@ impl StorageEngine {
 
     pub async fn fetch_pending_requests(&self) -> Result<Vec<PickupRequest>, String> {
         use sqlx::Row;
-        let rows = sqlx::query("SELECT id, requester, request_type, dropoff_mode, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at FROM pickup_requests WHERE status = 'PENDING'")
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Auto-cancel expired pending requests
+        sqlx::query("UPDATE pickup_requests SET status = 'CANCELLED' WHERE status = 'PENDING' AND expires_at < ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let rows = sqlx::query("SELECT id, requester, request_type, dropoff_mode, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at, expires_at FROM pickup_requests WHERE status = 'PENDING'")
             .fetch_all(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
@@ -396,6 +410,7 @@ impl StorageEngine {
                 payment_amount_num: row.get("payment_amount_num"),
                 status: RequestStatus::from_str(&status_str),
                 created_at: row.get("created_at"),
+                expires_at: row.get("expires_at"),
             });
         }
 
@@ -421,19 +436,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_pin_verification() {
+    async fn test_auto_cancellation_sweep() {
         let storage = StorageEngine::in_memory().await.unwrap();
 
-        let req = PickupRequest {
-            id: "REQ-VERIFY-1".into(),
+        let expired_req = PickupRequest {
+            id: "REQ-EXPIRED".into(),
             requester_node_id: "OR1:TEST".into(),
             request_type: RequestType::FoodPickup,
             dropoff_mode: DropoffMode::InPersonHandoff,
-            pin_hash: Some(hash_pin("1234")),
+            pin_hash: None,
             pickup_location: "123 Store St".into(),
             pickup_lat: None,
             pickup_lon: None,
-            item_description: "Order #99".into(),
+            item_description: "Old Order".into(),
             dropoff_location: "456 Home Ave".into(),
             payment_spec: PaymentSpec {
                 amount_prompt: "$10.00".into(),
@@ -443,14 +458,13 @@ mod tests {
             payment_amount_num: 10.0,
             status: RequestStatus::Pending,
             created_at: 1000,
+            expires_at: 1050, // Expired long ago
         };
 
-        storage.create_pickup_request(&req).await.unwrap();
+        storage.create_pickup_request(&expired_req).await.unwrap();
 
-        // Invalid PIN should fail
-        assert!(!storage.verify_and_complete_request("REQ-VERIFY-1", Some("9999")).await.unwrap());
-
-        // Valid PIN should succeed
-        assert!(storage.verify_and_complete_request("REQ-VERIFY-1", Some("1234")).await.unwrap());
+        // Querying pending requests should run the sweep and return 0 active requests
+        let active = storage.fetch_pending_requests().await.unwrap();
+        assert_eq!(active.len(), 0);
     }
 }

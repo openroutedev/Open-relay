@@ -50,6 +50,7 @@ struct CreatePickupOrderPayload {
     dropoff_location: String,
     payment_spec: PaymentSpec,
     payment_amount_num: f64,
+    ttl_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -158,6 +159,9 @@ async fn create_pickup_request(
         .unwrap()
         .as_secs() as i64;
 
+    let ttl = payload.ttl_seconds.unwrap_or(86400); // Default to 24 hours
+    let expires_at = now + ttl;
+
     let req_id = format!("REQ-{}", &hex::encode(blake3::hash(payload.item_description.as_bytes()).as_bytes())[..8]);
     let req_type = RequestType::from_str(payload.request_type.as_deref().unwrap_or("CUSTOM_TASK"));
     let drop_mode = DropoffMode::from_str(payload.dropoff_mode.as_deref().unwrap_or("IN_PERSON_HANDOFF"));
@@ -178,6 +182,7 @@ async fn create_pickup_request(
         payment_amount_num: payload.payment_amount_num,
         status: RequestStatus::Pending,
         created_at: now,
+        expires_at,
     };
 
     state.storage.create_pickup_request(&request).await?;
@@ -185,6 +190,7 @@ async fn create_pickup_request(
     Ok(Json(serde_json::json!({
         "status": "REQUEST_CREATED",
         "request_id": req_id,
+        "expires_at": expires_at,
         "state": "PENDING"
     })))
 }
