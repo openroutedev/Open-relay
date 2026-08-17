@@ -88,6 +88,7 @@ struct PriceEstimateQuery {
     pickup_lon: f64,
     dropoff_lat: f64,
     dropoff_lon: f64,
+    ttl_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -161,7 +162,24 @@ async fn get_peers(State(state): State<AppState>) -> Result<Json<Vec<PeerNode>>,
 
 async fn receive_gossip(State(state): State<AppState>, Json(msg): Json<GossipMessage>) -> Result<Json<serde_json::Value>, String> {
     if state.storage.record_gossip_seen(&msg.msg_id).await? {
-        Ok(Json(serde_json::json!({ "status": "GOSSIP_ACCEPTED" })))
+        
+        let msg_clone = msg.clone();
+        let storage_clone = state.storage.clone();
+        
+        // Spawn detached task to actively forward gossip to peers (excluding the origin)
+        tokio::spawn(async move {
+            if let Ok(peers) = storage_clone.fetch_peers().await {
+                let client = reqwest::Client::new();
+                for peer in peers {
+                    if peer.node_id != msg_clone.origin_node_id {
+                        let url = format!("{}/v1/gossip/broadcast", peer.endpoint_url);
+                        let _ = client.post(&url).json(&msg_clone).send().await;
+                    }
+                }
+            }
+        });
+
+        Ok(Json(serde_json::json!({ "status": "GOSSIP_ACCEPTED_AND_FORWARDED" })))
     } else {
         Ok(Json(serde_json::json!({ "status": "GOSSIP_DUPLICATE_IGNORED" })))
     }
@@ -170,12 +188,19 @@ async fn receive_gossip(State(state): State<AppState>, Json(msg): Json<GossipMes
 async fn pricing_estimate(Query(query): Query<PriceEstimateQuery>) -> Json<serde_json::Value> {
     let dist_km = haversine_km(query.pickup_lat, query.pickup_lon, query.dropoff_lat, query.dropoff_lon);
     
-    // Dynamic Algorithm: Base Rate ($5) + Distance ($1.20/km)
-    let suggested_base = 5.0 + (dist_km * 1.20);
+    // Apply Urgency Multiplier based on TTL
+    let urgency_multiplier = match query.ttl_seconds {
+        Some(ttl) if ttl <= 3600 => 1.5,   // < 1 hr: High urgency
+        Some(ttl) if ttl <= 10800 => 1.25, // < 3 hrs: Medium urgency
+        _ => 1.0,                          // Standard
+    };
+
+    let suggested_base = (5.0 + (dist_km * 1.20)) * urgency_multiplier;
     let anti_gouge_cap = suggested_base * 1.5;
 
     Json(serde_json::json!({
         "distance_km": dist_km,
+        "urgency_multiplier": urgency_multiplier,
         "suggested_amount": format!("{:.2}", suggested_base),
         "maximum_bid_cap": format!("{:.2}", anti_gouge_cap)
     }))
@@ -240,11 +265,23 @@ async fn file_dispute(
         return Err("Mandatory Abuse Protection: Evidence photo hash required to file dispute".into());
     }
 
+    let filer_id = state.identity.node_id();
+
+    // Protection 1: No duplicate disputes on the same request
+    if state.storage.has_existing_dispute(&request_id, &filer_id).await? {
+        return Err("You have already filed a dispute for this request.".into());
+    }
+
+    // Protection 2: Cooldown limit (Max 3 disputes per 15 minutes / 900 seconds)
+    if state.storage.check_dispute_rate_limit(&filer_id, 900).await? >= 3 {
+        return Err("Rate Limit Exceeded: Cooldown active due to excessive dispute filings.".into());
+    }
+
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     
     let dispute = DisputeRecord {
         request_id: request_id.clone(),
-        filed_by_node_id: state.identity.node_id(),
+        filed_by_node_id: filer_id,
         reason: payload.reason,
         evidence_hash: payload.evidence_hash,
         timestamp: now,
@@ -306,7 +343,6 @@ async fn complete_delivery(State(state): State<AppState>, Path(id): Path<String>
 async fn query_pickup_requests(State(state): State<AppState>, Query(filter): Query<RequestQueryFilter>) -> Result<Json<Vec<serde_json::Value>>, String> {
     let mut requests = state.storage.fetch_pending_requests().await?;
     
-    // Restored fully active filtering logic
     if let Some(min_amt) = filter.min_amount { 
         requests.retain(|r| r.payment_amount_num >= min_amt); 
     }
@@ -328,7 +364,6 @@ async fn query_pickup_requests(State(state): State<AppState>, Query(filter): Que
         requests.retain(|r| r.pickup_lat.zip(r.pickup_lon).map_or(false, |(lat, lon)| haversine_km(u_lat, u_lon, lat, lon) <= max_dist));
     }
 
-    // Restored fully active sorting logic
     let sort_mode = filter.sort_by.as_deref().unwrap_or("date");
     let is_desc = filter.order.as_deref().unwrap_or("desc") == "desc";
 

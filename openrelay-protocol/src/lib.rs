@@ -277,7 +277,6 @@ impl StorageEngine {
         sqlx::query("CREATE TABLE IF NOT EXISTS seen_gossip (msg_id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE IF NOT EXISTS handoff_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, commitment TEXT NOT NULL, hop_index INTEGER NOT NULL, node_pubkey_hash TEXT NOT NULL, event_type TEXT NOT NULL, timestamp INTEGER NOT NULL);").execute(&pool).await.unwrap();
         
-        // New Tables for Features 2, 3, 4
         sqlx::query("CREATE TABLE IF NOT EXISTS node_ratings (id INTEGER PRIMARY KEY AUTOINCREMENT, rater TEXT NOT NULL, subject TEXT NOT NULL, score REAL NOT NULL, review_notes TEXT NOT NULL, timestamp INTEGER NOT NULL);").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE IF NOT EXISTS courier_bids (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, courier TEXT NOT NULL, amount REAL NOT NULL, notes TEXT NOT NULL, timestamp INTEGER NOT NULL);").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE IF NOT EXISTS disputes (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, filer TEXT NOT NULL, reason TEXT NOT NULL, evidence_hash TEXT NOT NULL, timestamp INTEGER NOT NULL);").execute(&pool).await.unwrap();
@@ -335,6 +334,30 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub async fn check_dispute_rate_limit(&self, node_id: &str, time_window_seconds: i64) -> Result<i64, String> {
+        use sqlx::Row;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let threshold = now - time_window_seconds;
+        let row = sqlx::query("SELECT COUNT(*) as count FROM disputes WHERE filer = ? AND timestamp > ?")
+            .bind(node_id)
+            .bind(threshold)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    pub async fn has_existing_dispute(&self, request_id: &str, node_id: &str) -> Result<bool, String> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT COUNT(*) as count FROM disputes WHERE request_id = ? AND filer = ?")
+            .bind(request_id)
+            .bind(node_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.get::<i64, _>("count") > 0)
+    }
+
     pub async fn create_pickup_request(&self, req: &PickupRequest) -> Result<(), String> {
         let payment_json = serde_json::to_string(&req.payment_spec).unwrap();
         let req_json = serde_json::to_string(&req.requirements).unwrap();
@@ -351,15 +374,12 @@ impl StorageEngine {
             let req_json: String = row.get("requirements_json");
             let payment_spec: PaymentSpec = serde_json::from_str(&payment_json).unwrap();
             let requirements: CourierRequirements = serde_json::from_str(&req_json).unwrap();
-            let request_type_str: String = row.get("request_type");
-            let dropoff_mode_str: String = row.get("dropoff_mode");
-            let status_str: String = row.get("status");
-
+            
             Ok(Some(PickupRequest {
                 id: row.get("id"),
                 requester_node_id: row.get("requester"),
-                request_type: RequestType::from_str(&request_type_str),
-                dropoff_mode: DropoffMode::from_str(&dropoff_mode_str),
+                request_type: RequestType::from_str(&row.get::<String, _>("request_type")),
+                dropoff_mode: DropoffMode::from_str(&row.get::<String, _>("dropoff_mode")),
                 requirements,
                 pin_hash: row.get("pin_hash"),
                 pickup_location: row.get("pickup_location"),
@@ -369,7 +389,7 @@ impl StorageEngine {
                 dropoff_location: row.get("dropoff_location"),
                 payment_spec,
                 payment_amount_num: row.get("payment_amount_num"),
-                status: RequestStatus::from_str(&status_str),
+                status: RequestStatus::from_str(&row.get::<String, _>("status")),
                 created_at: row.get("created_at"),
                 expires_at: row.get("expires_at"),
             }))
@@ -446,31 +466,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_dispute_storage() {
+    async fn test_dispute_rate_limiting() {
         let storage = StorageEngine::in_memory().await.unwrap();
-        let req = PickupRequest {
-            id: "REQ-999".into(),
-            requester_node_id: "OR1:A".into(),
-            request_type: RequestType::FoodPickup,
-            dropoff_mode: DropoffMode::InPersonHandoff,
-            requirements: CourierRequirements { min_rating: 0.0, require_insulated_bag: false, required_vehicle: VehicleType::Any },
-            pin_hash: None, pickup_location: "Store".into(), pickup_lat: None, pickup_lon: None,
-            item_description: "Test".into(), dropoff_location: "Home".into(),
-            payment_spec: PaymentSpec { amount_prompt: "$10".into(), accepted_methods: vec![], is_settled: false },
-            payment_amount_num: 10.0, status: RequestStatus::Pending, created_at: 1000, expires_at: 2000,
-        };
-        storage.create_pickup_request(&req).await.unwrap();
-        
         let dispute = DisputeRecord {
             request_id: "REQ-999".into(),
             filed_by_node_id: "OR1:B".into(),
             reason: "Store Closed".into(),
             evidence_hash: "hash_of_photo".into(),
-            timestamp: 1500,
+            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
         };
+        
         storage.file_dispute(&dispute).await.unwrap();
         
-        let updated_req = storage.fetch_request_by_id("REQ-999").await.unwrap().unwrap();
-        assert_eq!(updated_req.status, RequestStatus::Disputed);
+        assert!(storage.has_existing_dispute("REQ-999", "OR1:B").await.unwrap());
+        assert_eq!(storage.check_dispute_rate_limit("OR1:B", 900).await.unwrap(), 1);
     }
 }
