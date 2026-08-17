@@ -6,8 +6,9 @@ use axum::{
 use openrelay_crypto::identity::NodeIdentity;
 use openrelay_label::{format::PackageLabelData, pdf::PackingSlipGenerator};
 use openrelay_protocol::{
-    hash_pin, haversine_km, DropoffMode, HandoffRecord, PaymentSpec, PickupRequest, RequestStatus,
-    RequestType, ShipmentState, StorageEngine,
+    hash_pin, haversine_km, CourierRequirements, DropoffMode, GossipMessage, HandoffRecord,
+    PaymentSpec, PeerNode, PickupRequest, RequestStatus, RequestType, ShipmentState,
+    StorageEngine, VehicleType,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -51,6 +52,9 @@ struct CreatePickupOrderPayload {
     payment_spec: PaymentSpec,
     payment_amount_num: f64,
     ttl_seconds: Option<i64>,
+    min_rating: Option<f64>,
+    require_insulated_bag: Option<bool>,
+    required_vehicle: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +76,12 @@ struct RequestQueryFilter {
     max_distance_km: Option<f64>,
 }
 
+#[derive(Deserialize)]
+struct RegisterPeerPayload {
+    node_id: String,
+    endpoint_url: String,
+}
+
 #[tokio::main]
 async fn main() {
     println!("=== Starting OpenRelay v0.3 Node Daemon ===");
@@ -89,6 +99,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/v1/status", get(get_status))
+        .route("/v1/peers", get(get_peers).post(register_peer))
+        .route("/v1/gossip/broadcast", post(receive_gossip))
         .route("/v1/label/pdf", post(generate_label_pdf))
         .route("/v1/shipments", post(create_shipment))
         .route("/v1/shipments/:commitment/history", get(get_shipment_history))
@@ -109,6 +121,45 @@ async fn get_status(State(state): State<AppState>) -> Json<serde_json::Value> {
         "version": "0.3.0",
         "node_id": state.identity.node_id()
     }))
+}
+
+async fn register_peer(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterPeerPayload>,
+) -> Result<Json<serde_json::Value>, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let peer = PeerNode {
+        node_id: payload.node_id,
+        endpoint_url: payload.endpoint_url,
+        last_seen: now,
+    };
+
+    state.storage.register_peer(&peer).await?;
+
+    Ok(Json(serde_json::json!({ "status": "PEER_REGISTERED" })))
+}
+
+async fn get_peers(State(state): State<AppState>) -> Result<Json<Vec<PeerNode>>, String> {
+    let peers = state.storage.fetch_peers().await?;
+    Ok(Json(peers))
+}
+
+async fn receive_gossip(
+    State(state): State<AppState>,
+    Json(msg): Json<GossipMessage>,
+) -> Result<Json<serde_json::Value>, String> {
+    let is_new = state.storage.record_gossip_seen(&msg.msg_id).await?;
+
+    if is_new {
+        println!("[+] New gossip message processed: {}", msg.msg_id);
+        Ok(Json(serde_json::json!({ "status": "GOSSIP_ACCEPTED" })))
+    } else {
+        Ok(Json(serde_json::json!({ "status": "GOSSIP_DUPLICATE_IGNORED" })))
+    }
 }
 
 async fn create_shipment(
@@ -159,7 +210,7 @@ async fn create_pickup_request(
         .unwrap()
         .as_secs() as i64;
 
-    let ttl = payload.ttl_seconds.unwrap_or(86400); // Default to 24 hours
+    let ttl = payload.ttl_seconds.unwrap_or(86400);
     let expires_at = now + ttl;
 
     let req_id = format!("REQ-{}", &hex::encode(blake3::hash(payload.item_description.as_bytes()).as_bytes())[..8]);
@@ -167,11 +218,18 @@ async fn create_pickup_request(
     let drop_mode = DropoffMode::from_str(payload.dropoff_mode.as_deref().unwrap_or("IN_PERSON_HANDOFF"));
     let pin_hash = payload.verification_pin.as_deref().map(hash_pin);
 
+    let requirements = CourierRequirements {
+        min_rating: payload.min_rating.unwrap_or(0.0),
+        require_insulated_bag: payload.require_insulated_bag.unwrap_or(false),
+        required_vehicle: VehicleType::from_str(payload.required_vehicle.as_deref().unwrap_or("ANY")),
+    };
+
     let request = PickupRequest {
         id: req_id.clone(),
         requester_node_id: state.identity.node_id(),
         request_type: req_type,
         dropoff_mode: drop_mode,
+        requirements,
         pin_hash,
         pickup_location: payload.pickup_location,
         pickup_lat: payload.pickup_lat,

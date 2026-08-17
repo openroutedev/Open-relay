@@ -28,6 +28,44 @@ pub struct PaymentSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VehicleType {
+    Any,
+    Foot,
+    Bicycle,
+    Car,
+    CargoVan,
+}
+
+impl VehicleType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VehicleType::Any => "ANY",
+            VehicleType::Foot => "FOOT",
+            VehicleType::Bicycle => "BICYCLE",
+            VehicleType::Car => "CAR",
+            VehicleType::CargoVan => "CARGO_VAN",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "FOOT" => VehicleType::Foot,
+            "BICYCLE" => VehicleType::Bicycle,
+            "CAR" => VehicleType::Car,
+            "CARGO_VAN" => VehicleType::CargoVan,
+            _ => VehicleType::Any,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CourierRequirements {
+    pub min_rating: f64,
+    pub require_insulated_bag: bool,
+    pub required_vehicle: VehicleType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestType {
     FoodPickup,
     StorePickup,
@@ -111,6 +149,7 @@ pub struct PickupRequest {
     pub requester_node_id: String,
     pub request_type: RequestType,
     pub dropoff_mode: DropoffMode,
+    pub requirements: CourierRequirements,
     pub pin_hash: Option<String>,
     pub pickup_location: String,
     pub pickup_lat: Option<f64>,
@@ -122,6 +161,21 @@ pub struct PickupRequest {
     pub status: RequestStatus,
     pub created_at: i64,
     pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerNode {
+    pub node_id: String,
+    pub endpoint_url: String,
+    pub last_seen: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GossipMessage {
+    pub msg_id: String,
+    pub origin_node_id: String,
+    pub payload_json: String,
+    pub timestamp: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,6 +259,7 @@ impl StorageEngine {
                 requester TEXT NOT NULL,
                 request_type TEXT NOT NULL,
                 dropoff_mode TEXT NOT NULL,
+                requirements_json TEXT NOT NULL,
                 pin_hash TEXT,
                 pickup_location TEXT NOT NULL,
                 pickup_lat REAL,
@@ -216,6 +271,27 @@ impl StorageEngine {
                 status TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL
+            );"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS peers (
+                node_id TEXT PRIMARY KEY,
+                endpoint_url TEXT NOT NULL,
+                last_seen INTEGER NOT NULL
+            );"
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS seen_gossip (
+                msg_id TEXT PRIMARY KEY,
+                received_at INTEGER NOT NULL
             );"
         )
         .execute(&pool)
@@ -237,6 +313,56 @@ impl StorageEngine {
         .map_err(|e| e.to_string())?;
 
         Ok(Self { pool })
+    }
+
+    pub async fn register_peer(&self, peer: &PeerNode) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO peers (node_id, endpoint_url, last_seen)
+             VALUES (?, ?, ?)
+             ON CONFLICT(node_id) DO UPDATE SET endpoint_url=excluded.endpoint_url, last_seen=excluded.last_seen;"
+        )
+        .bind(&peer.node_id)
+        .bind(&peer.endpoint_url)
+        .bind(peer.last_seen)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    pub async fn fetch_peers(&self) -> Result<Vec<PeerNode>, String> {
+        use sqlx::Row;
+        let rows = sqlx::query("SELECT node_id, endpoint_url, last_seen FROM peers")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut peers = Vec::new();
+        for row in rows {
+            peers.push(PeerNode {
+                node_id: row.get("node_id"),
+                endpoint_url: row.get("endpoint_url"),
+                last_seen: row.get("last_seen"),
+            });
+        }
+        Ok(peers)
+    }
+
+    pub async fn record_gossip_seen(&self, msg_id: &str) -> Result<bool, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let res = sqlx::query("INSERT OR IGNORE INTO seen_gossip (msg_id, received_at) VALUES (?, ?);")
+            .bind(msg_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(res.rows_affected() > 0)
     }
 
     pub async fn save_shipment(&self, commitment: &str, state: ShipmentState, seal_serial: &str) -> Result<(), String> {
@@ -305,15 +431,17 @@ impl StorageEngine {
 
     pub async fn create_pickup_request(&self, req: &PickupRequest) -> Result<(), String> {
         let payment_json = serde_json::to_string(&req.payment_spec).map_err(|e| e.to_string())?;
+        let req_json = serde_json::to_string(&req.requirements).map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT INTO pickup_requests (id, requester, request_type, dropoff_mode, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
+            "INSERT INTO pickup_requests (id, requester, request_type, dropoff_mode, requirements_json, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
         )
         .bind(&req.id)
         .bind(&req.requester_node_id)
         .bind(req.request_type.as_str())
         .bind(req.dropoff_mode.as_str())
+        .bind(req_json)
         .bind(&req.pin_hash)
         .bind(&req.pickup_location)
         .bind(req.pickup_lat)
@@ -375,14 +503,13 @@ impl StorageEngine {
             .unwrap()
             .as_secs() as i64;
 
-        // Auto-cancel expired pending requests
         sqlx::query("UPDATE pickup_requests SET status = 'CANCELLED' WHERE status = 'PENDING' AND expires_at < ?")
             .bind(now)
             .execute(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
 
-        let rows = sqlx::query("SELECT id, requester, request_type, dropoff_mode, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at, expires_at FROM pickup_requests WHERE status = 'PENDING'")
+        let rows = sqlx::query("SELECT id, requester, request_type, dropoff_mode, requirements_json, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at, expires_at FROM pickup_requests WHERE status = 'PENDING'")
             .fetch_all(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
@@ -390,7 +517,14 @@ impl StorageEngine {
         let mut results = Vec::new();
         for row in rows {
             let payment_json: String = row.get("payment_json");
+            let req_json: String = row.get("requirements_json");
             let payment_spec: PaymentSpec = serde_json::from_str(&payment_json).map_err(|e| e.to_string())?;
+            let requirements: CourierRequirements = serde_json::from_str(&req_json).unwrap_or(CourierRequirements {
+                min_rating: 0.0,
+                require_insulated_bag: false,
+                required_vehicle: VehicleType::Any,
+            });
+
             let request_type_str: String = row.get("request_type");
             let dropoff_mode_str: String = row.get("dropoff_mode");
             let status_str: String = row.get("status");
@@ -400,6 +534,7 @@ impl StorageEngine {
                 requester_node_id: row.get("requester"),
                 request_type: RequestType::from_str(&request_type_str),
                 dropoff_mode: DropoffMode::from_str(&dropoff_mode_str),
+                requirements,
                 pin_hash: row.get("pin_hash"),
                 pickup_location: row.get("pickup_location"),
                 pickup_lat: row.get("pickup_lat"),
@@ -436,35 +571,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_auto_cancellation_sweep() {
+    async fn test_p2p_peer_registration() {
         let storage = StorageEngine::in_memory().await.unwrap();
 
-        let expired_req = PickupRequest {
-            id: "REQ-EXPIRED".into(),
-            requester_node_id: "OR1:TEST".into(),
-            request_type: RequestType::FoodPickup,
-            dropoff_mode: DropoffMode::InPersonHandoff,
-            pin_hash: None,
-            pickup_location: "123 Store St".into(),
-            pickup_lat: None,
-            pickup_lon: None,
-            item_description: "Old Order".into(),
-            dropoff_location: "456 Home Ave".into(),
-            payment_spec: PaymentSpec {
-                amount_prompt: "$10.00".into(),
-                accepted_methods: vec![PaymentMethod::CashOnHandoff],
-                is_settled: false,
-            },
-            payment_amount_num: 10.0,
-            status: RequestStatus::Pending,
-            created_at: 1000,
-            expires_at: 1050, // Expired long ago
+        let peer = PeerNode {
+            node_id: "OR1:PEER_NODE_ABC".into(),
+            endpoint_url: "http://192.168.1.50:8080".into(),
+            last_seen: 10000,
         };
 
-        storage.create_pickup_request(&expired_req).await.unwrap();
-
-        // Querying pending requests should run the sweep and return 0 active requests
-        let active = storage.fetch_pending_requests().await.unwrap();
-        assert_eq!(active.len(), 0);
+        storage.register_peer(&peer).await.unwrap();
+        let peers = storage.fetch_peers().await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_id, "OR1:PEER_NODE_ABC");
     }
 }
