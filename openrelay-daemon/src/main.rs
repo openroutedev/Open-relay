@@ -6,8 +6,8 @@ use axum::{
 use openrelay_crypto::identity::NodeIdentity;
 use openrelay_label::{format::PackageLabelData, pdf::PackingSlipGenerator};
 use openrelay_protocol::{
-    haversine_km, HandoffRecord, PaymentSpec, PickupRequest, RequestStatus, RequestType,
-    ShipmentState, StorageEngine,
+    hash_pin, haversine_km, DropoffMode, HandoffRecord, PaymentSpec, PickupRequest, RequestStatus,
+    RequestType, ShipmentState, StorageEngine,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -41,6 +41,8 @@ struct CreateShipmentRequest {
 #[derive(Deserialize)]
 struct CreatePickupOrderPayload {
     request_type: Option<String>,
+    dropoff_mode: Option<String>,
+    verification_pin: Option<String>,
     pickup_location: String,
     pickup_lat: Option<f64>,
     pickup_lon: Option<f64>,
@@ -48,6 +50,13 @@ struct CreatePickupOrderPayload {
     dropoff_location: String,
     payment_spec: PaymentSpec,
     payment_amount_num: f64,
+}
+
+#[derive(Deserialize)]
+struct CompleteDeliveryPayload {
+    verification_pin: Option<String>,
+    dropoff_notes: Option<String>,
+    photo_hash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +92,7 @@ async fn main() {
         .route("/v1/shipments", post(create_shipment))
         .route("/v1/shipments/:commitment/history", get(get_shipment_history))
         .route("/v1/requests", post(create_pickup_request).get(query_pickup_requests))
+        .route("/v1/requests/:id/complete", post(complete_delivery))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
@@ -150,11 +160,15 @@ async fn create_pickup_request(
 
     let req_id = format!("REQ-{}", &hex::encode(blake3::hash(payload.item_description.as_bytes()).as_bytes())[..8]);
     let req_type = RequestType::from_str(payload.request_type.as_deref().unwrap_or("CUSTOM_TASK"));
+    let drop_mode = DropoffMode::from_str(payload.dropoff_mode.as_deref().unwrap_or("IN_PERSON_HANDOFF"));
+    let pin_hash = payload.verification_pin.as_deref().map(hash_pin);
 
     let request = PickupRequest {
         id: req_id.clone(),
         requester_node_id: state.identity.node_id(),
         request_type: req_type,
+        dropoff_mode: drop_mode,
+        pin_hash,
         pickup_location: payload.pickup_location,
         pickup_lat: payload.pickup_lat,
         pickup_lon: payload.pickup_lon,
@@ -172,6 +186,46 @@ async fn create_pickup_request(
         "status": "REQUEST_CREATED",
         "request_id": req_id,
         "state": "PENDING"
+    })))
+}
+
+async fn complete_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<CompleteDeliveryPayload>,
+) -> Result<Json<serde_json::Value>, String> {
+    let verified = state
+        .storage
+        .verify_and_complete_request(&id, payload.verification_pin.as_deref())
+        .await?;
+
+    if !verified {
+        return Err("Verification failed: invalid PIN or missing credentials".into());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let log = HandoffRecord {
+        commitment: id.clone(),
+        hop_index: 99,
+        node_pubkey_hash: state.identity.node_id(),
+        event_type: format!(
+            "DELIVERY_COMPLETED | Notes: {} | PhotoHash: {}",
+            payload.dropoff_notes.unwrap_or_else(|| "None".into()),
+            payload.photo_hash.unwrap_or_else(|| "None".into())
+        ),
+        timestamp: now,
+    };
+
+    state.storage.record_handoff_event(&log).await?;
+
+    Ok(Json(serde_json::json!({
+        "status": "SUCCESS",
+        "request_id": id,
+        "state": "COMPLETED"
     })))
 }
 

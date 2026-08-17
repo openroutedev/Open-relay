@@ -1711,6 +1711,7 @@ dependencies = [
 name = "openrelay-protocol"
 version = "0.3.0"
 dependencies = [
+ "blake3",
  "hex",
  "openrelay-crypto",
  "serde",

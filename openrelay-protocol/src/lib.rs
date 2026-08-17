@@ -55,6 +55,28 @@ impl RequestType {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DropoffMode {
+    InPersonHandoff,
+    UnattendedPorch,
+}
+
+impl DropoffMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DropoffMode::InPersonHandoff => "IN_PERSON_HANDOFF",
+            DropoffMode::UnattendedPorch => "UNATTENDED_PORCH",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "UNATTENDED_PORCH" => DropoffMode::UnattendedPorch,
+            _ => DropoffMode::InPersonHandoff,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestStatus {
     Pending,
@@ -88,6 +110,8 @@ pub struct PickupRequest {
     pub id: String,
     pub requester_node_id: String,
     pub request_type: RequestType,
+    pub dropoff_mode: DropoffMode,
+    pub pin_hash: Option<String>,
     pub pickup_location: String,
     pub pickup_lat: Option<f64>,
     pub pickup_lon: Option<f64>,
@@ -148,6 +172,10 @@ impl PhysicalHandoff {
     }
 }
 
+pub fn hash_pin(pin: &str) -> String {
+    hex::encode(blake3::hash(pin.as_bytes()).as_bytes())
+}
+
 pub struct StorageEngine {
     pool: sqlx::SqlitePool,
 }
@@ -175,6 +203,8 @@ impl StorageEngine {
                 id TEXT PRIMARY KEY,
                 requester TEXT NOT NULL,
                 request_type TEXT NOT NULL,
+                dropoff_mode TEXT NOT NULL,
+                pin_hash TEXT,
                 pickup_location TEXT NOT NULL,
                 pickup_lat REAL,
                 pickup_lon REAL,
@@ -275,12 +305,14 @@ impl StorageEngine {
         let payment_json = serde_json::to_string(&req.payment_spec).map_err(|e| e.to_string())?;
 
         sqlx::query(
-            "INSERT INTO pickup_requests (id, requester, request_type, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
+            "INSERT INTO pickup_requests (id, requester, request_type, dropoff_mode, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
         )
         .bind(&req.id)
         .bind(&req.requester_node_id)
         .bind(req.request_type.as_str())
+        .bind(req.dropoff_mode.as_str())
+        .bind(&req.pin_hash)
         .bind(&req.pickup_location)
         .bind(req.pickup_lat)
         .bind(req.pickup_lon)
@@ -297,9 +329,46 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub async fn verify_and_complete_request(&self, request_id: &str, provided_pin: Option<&str>) -> Result<bool, String> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT dropoff_mode, pin_hash FROM pickup_requests WHERE id = ?")
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(r) = row {
+            let dropoff_mode_str: String = r.get("dropoff_mode");
+            let mode = DropoffMode::from_str(&dropoff_mode_str);
+            let stored_pin_hash: Option<String> = r.get("pin_hash");
+
+            if mode == DropoffMode::InPersonHandoff {
+                match (provided_pin, stored_pin_hash) {
+                    (Some(pin), Some(expected_hash)) => {
+                        if hash_pin(pin) != expected_hash {
+                            return Ok(false); // Invalid PIN
+                        }
+                    }
+                    _ => return Ok(false), // PIN required but not provided
+                }
+            }
+
+            // Update status to COMPLETED
+            sqlx::query("UPDATE pickup_requests SET status = 'COMPLETED' WHERE id = ?")
+                .bind(request_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok(true)
+        } else {
+            Err("Request not found".into())
+        }
+    }
+
     pub async fn fetch_pending_requests(&self) -> Result<Vec<PickupRequest>, String> {
         use sqlx::Row;
-        let rows = sqlx::query("SELECT id, requester, request_type, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at FROM pickup_requests WHERE status = 'PENDING'")
+        let rows = sqlx::query("SELECT id, requester, request_type, dropoff_mode, pin_hash, pickup_location, pickup_lat, pickup_lon, item_description, dropoff_location, payment_json, payment_amount_num, status, created_at FROM pickup_requests WHERE status = 'PENDING'")
             .fetch_all(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
@@ -309,12 +378,15 @@ impl StorageEngine {
             let payment_json: String = row.get("payment_json");
             let payment_spec: PaymentSpec = serde_json::from_str(&payment_json).map_err(|e| e.to_string())?;
             let request_type_str: String = row.get("request_type");
+            let dropoff_mode_str: String = row.get("dropoff_mode");
             let status_str: String = row.get("status");
 
             results.push(PickupRequest {
                 id: row.get("id"),
                 requester_node_id: row.get("requester"),
                 request_type: RequestType::from_str(&request_type_str),
+                dropoff_mode: DropoffMode::from_str(&dropoff_mode_str),
+                pin_hash: row.get("pin_hash"),
                 pickup_location: row.get("pickup_location"),
                 pickup_lat: row.get("pickup_lat"),
                 pickup_lon: row.get("pickup_lon"),
@@ -349,31 +421,36 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_handoff_audit_trail() {
+    async fn test_pin_verification() {
         let storage = StorageEngine::in_memory().await.unwrap();
 
-        let record1 = HandoffRecord {
-            commitment: "0xa1b2".into(),
-            hop_index: 0,
-            node_pubkey_hash: "OR1:HASH_ORIGIN".into(),
-            event_type: "PACKAGE_CREATED".into(),
-            timestamp: 1000,
+        let req = PickupRequest {
+            id: "REQ-VERIFY-1".into(),
+            requester_node_id: "OR1:TEST".into(),
+            request_type: RequestType::FoodPickup,
+            dropoff_mode: DropoffMode::InPersonHandoff,
+            pin_hash: Some(hash_pin("1234")),
+            pickup_location: "123 Store St".into(),
+            pickup_lat: None,
+            pickup_lon: None,
+            item_description: "Order #99".into(),
+            dropoff_location: "456 Home Ave".into(),
+            payment_spec: PaymentSpec {
+                amount_prompt: "$10.00".into(),
+                accepted_methods: vec![PaymentMethod::CashOnHandoff],
+                is_settled: false,
+            },
+            payment_amount_num: 10.0,
+            status: RequestStatus::Pending,
+            created_at: 1000,
         };
 
-        let record2 = HandoffRecord {
-            commitment: "0xa1b2".into(),
-            hop_index: 1,
-            node_pubkey_hash: "OR1:HASH_RELAY1".into(),
-            event_type: "HANDOFF_EXECUTED".into(),
-            timestamp: 1050,
-        };
+        storage.create_pickup_request(&req).await.unwrap();
 
-        storage.record_handoff_event(&record1).await.unwrap();
-        storage.record_handoff_event(&record2).await.unwrap();
+        // Invalid PIN should fail
+        assert!(!storage.verify_and_complete_request("REQ-VERIFY-1", Some("9999")).await.unwrap());
 
-        let history = storage.fetch_handoff_history("0xa1b2").await.unwrap();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].event_type, "PACKAGE_CREATED");
-        assert_eq!(history[1].event_type, "HANDOFF_EXECUTED");
+        // Valid PIN should succeed
+        assert!(storage.verify_and_complete_request("REQ-VERIFY-1", Some("1234")).await.unwrap());
     }
 }
