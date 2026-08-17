@@ -1,0 +1,8 @@
+/target/
+*.db
+*.sqlite
+*.sqlite-journal
+*.pdf
+manifest.pdf
+.DS_Store
+.env

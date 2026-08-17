@@ -1,0 +1,10 @@
+[package]
+name = "openrelay-label"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+image = "0.23.14"
+qrcode = "0.12"
+printpdf = "0.5"
+serde = { version = "1.0", features = ["derive"] }

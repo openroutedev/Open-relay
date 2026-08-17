@@ -1,0 +1,18 @@
+[package]
+name = "openrelay-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+openrelay-crypto = { path = "../openrelay-crypto" }
+openrelay-protocol = { path = "../openrelay-protocol" }
+openrelay-bonding = { path = "../openrelay-bonding" }
+openrelay-label = { path = "../openrelay-label" }
+axum = "0.7"
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tower-http = { version = "0.5", features = ["cors"] }
+data-encoding = "2.5"
+hex = "0.4"
+x25519-dalek = "2.0"

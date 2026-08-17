@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "openrelay-crypto",
+    "openrelay-protocol",
+    "openrelay-bonding",
+    "openrelay-label",
+    "openrelay-daemon",
+    "openrelay-cli",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+authors = ["OpenRelay Contributors"]
+license = "MIT OR Apache-2.0"
