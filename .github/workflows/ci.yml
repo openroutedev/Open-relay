@@ -1,0 +1,33 @@
+name: OpenRelay CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Workspace Check
+        run: cargo check --workspace --all-targets
+
+      - name: Workspace Tests
+        run: cargo test --workspace
+
+      - name: Clippy Linter
+        run: cargo clippy --workspace -- -D warnings
