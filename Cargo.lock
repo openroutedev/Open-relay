@@ -1713,6 +1713,7 @@ dependencies = [
  "hex",
  "openrelay-crypto",
  "serde",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",

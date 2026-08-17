@@ -1,6 +1,21 @@
 use openrelay_crypto::identity::NodeIdentity;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaymentMethod {
+    CashOnHandoff,
+    P2PFiat { provider: String, handle: String }, // e.g., Venmo, Cash App, Zelle
+    Crypto { network: String, address_or_invoice: String }, // e.g., Lightning, Solana, USDC
+    Custom(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentSpec {
+    pub amount_prompt: String,           // e.g., "$15.00" or "0.0003 BTC"
+    pub accepted_methods: Vec<PaymentMethod>,
+    pub is_settled: bool,                 // Marked during physical handoff
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShipmentState {
     Created,
@@ -97,5 +112,24 @@ mod tests {
     async fn test_sqlite_persistence() {
         let storage = StorageEngine::in_memory().await.unwrap();
         assert!(storage.save_shipment("0x123", ShipmentState::InTransit, "SEAL-999").await.is_ok());
+    }
+
+    #[test]
+    fn test_payment_spec_serialization() {
+        let spec = PaymentSpec {
+            amount_prompt: "$15.00".to_string(),
+            accepted_methods: vec![
+                PaymentMethod::CashOnHandoff,
+                PaymentMethod::P2PFiat {
+                    provider: "Venmo".to_string(),
+                    handle: "@relay_user".to_string(),
+                },
+            ],
+            is_settled: false,
+        };
+
+        let json = serde_json::to_string(&spec).unwrap();
+        let deserialized: PaymentSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(spec, deserialized);
     }
 }
