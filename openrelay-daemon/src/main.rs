@@ -1,8 +1,10 @@
 use axum::{
     extract::{Path, Query, State},
+    response::sse::{Event, Sse},
     routing::{get, post},
     Json, Router,
 };
+use futures_util::stream::Stream;
 use openrelay_crypto::identity::NodeIdentity;
 use openrelay_label::{format::PackageLabelData, pdf::PackingSlipGenerator};
 use openrelay_protocol::{
@@ -13,11 +15,16 @@ use openrelay_protocol::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 struct AppState {
     identity: Arc<NodeIdentity>,
     storage: Arc<StorageEngine>,
+    event_tx: broadcast::Sender<String>,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +69,11 @@ struct CompleteDeliveryPayload {
     verification_pin: Option<String>,
     dropoff_notes: Option<String>,
     photo_hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AcceptBidPayload {
+    courier_node_id: String,
 }
 
 #[derive(Deserialize)]
@@ -119,24 +131,36 @@ async fn main() {
     let storage = StorageEngine::in_memory().await.expect("Failed to init storage");
     println!("[+] SQLite storage initialized");
 
+    let (event_tx, _) = broadcast::channel::<String>(100);
+
     let state = AppState {
         identity: Arc::new(node_identity),
         storage: Arc::new(storage),
+        event_tx,
     };
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let app = Router::new()
         .route("/v1/status", get(get_status))
+        .route("/v1/events", get(sse_events_handler))
         .route("/v1/peers", get(get_peers).post(register_peer))
         .route("/v1/gossip/broadcast", post(receive_gossip))
         .route("/v1/pricing/estimate", get(pricing_estimate))
         .route("/v1/nodes/:id/rate", post(submit_rating))
-        .route("/v1/requests/:id/bids", post(submit_bid))
+        .route("/v1/requests/:id", get(get_single_request))
+        .route("/v1/requests/:id/bids", get(get_request_bids).post(submit_bid))
+        .route("/v1/requests/:id/accept_bid", post(accept_bid))
         .route("/v1/requests/:id/dispute", post(file_dispute))
         .route("/v1/label/pdf", post(generate_label_pdf))
         .route("/v1/shipments", post(create_shipment))
         .route("/v1/shipments/:commitment/history", get(get_shipment_history))
         .route("/v1/requests", post(create_pickup_request).get(query_pickup_requests))
         .route("/v1/requests/:id/complete", post(complete_delivery))
+        .layer(cors)
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
@@ -148,6 +172,48 @@ async fn main() {
 
 async fn get_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ACTIVE_ONLINE", "version": "0.3.0", "node_id": state.identity.node_id() }))
+}
+
+async fn sse_events_handler(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+    let rx = state.event_tx.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|res| match res {
+        Ok(msg) => Some(Ok(Event::default().data(msg))),
+        Err(_) => None,
+    });
+    Sse::new(stream)
+}
+
+async fn get_single_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PickupRequest>, String> {
+    let request = state
+        .storage
+        .fetch_request_by_id(&id)
+        .await?
+        .ok_or_else(|| "Request not found".to_string())?;
+    Ok(Json(request))
+}
+
+async fn get_request_bids(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<CourierBid>>, String> {
+    let bids = state.storage.fetch_bids_for_request(&id).await?;
+    Ok(Json(bids))
+}
+
+async fn accept_bid(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<AcceptBidPayload>,
+) -> Result<Json<serde_json::Value>, String> {
+    state.storage.accept_bid(&id, &payload.courier_node_id).await?;
+    let event_msg = format!("BID_ACCEPTED|{}|{}", id, payload.courier_node_id);
+    let _ = state.event_tx.send(event_msg);
+    Ok(Json(serde_json::json!({ "status": "BID_ACCEPTED", "request_id": id, "courier": payload.courier_node_id })))
 }
 
 async fn register_peer(State(state): State<AppState>, Json(payload): Json<RegisterPeerPayload>) -> Result<Json<serde_json::Value>, String> {
@@ -162,11 +228,8 @@ async fn get_peers(State(state): State<AppState>) -> Result<Json<Vec<PeerNode>>,
 
 async fn receive_gossip(State(state): State<AppState>, Json(msg): Json<GossipMessage>) -> Result<Json<serde_json::Value>, String> {
     if state.storage.record_gossip_seen(&msg.msg_id).await? {
-        
         let msg_clone = msg.clone();
         let storage_clone = state.storage.clone();
-        
-        // Spawn detached task to actively forward gossip to peers (excluding the origin)
         tokio::spawn(async move {
             if let Ok(peers) = storage_clone.fetch_peers().await {
                 let client = reqwest::Client::new();
@@ -178,7 +241,6 @@ async fn receive_gossip(State(state): State<AppState>, Json(msg): Json<GossipMes
                 }
             }
         });
-
         Ok(Json(serde_json::json!({ "status": "GOSSIP_ACCEPTED_AND_FORWARDED" })))
     } else {
         Ok(Json(serde_json::json!({ "status": "GOSSIP_DUPLICATE_IGNORED" })))
@@ -187,14 +249,11 @@ async fn receive_gossip(State(state): State<AppState>, Json(msg): Json<GossipMes
 
 async fn pricing_estimate(Query(query): Query<PriceEstimateQuery>) -> Json<serde_json::Value> {
     let dist_km = haversine_km(query.pickup_lat, query.pickup_lon, query.dropoff_lat, query.dropoff_lon);
-    
-    // Apply Urgency Multiplier based on TTL
     let urgency_multiplier = match query.ttl_seconds {
-        Some(ttl) if ttl <= 3600 => 1.5,   // < 1 hr: High urgency
-        Some(ttl) if ttl <= 10800 => 1.25, // < 3 hrs: Medium urgency
-        _ => 1.0,                          // Standard
+        Some(ttl) if ttl <= 3600 => 1.5,
+        Some(ttl) if ttl <= 10800 => 1.25,
+        _ => 1.0,
     };
-
     let suggested_base = (5.0 + (dist_km * 1.20)) * urgency_multiplier;
     let anti_gouge_cap = suggested_base * 1.5;
 
@@ -253,6 +312,7 @@ async fn submit_bid(
     };
 
     state.storage.save_bid(&bid).await?;
+    let _ = state.event_tx.send(format!("NEW_BID|{}|{}", request_id, payload.bid_amount));
     Ok(Json(serde_json::json!({ "status": "BID_SUBMITTED", "request_id": request_id })))
 }
 
@@ -267,12 +327,10 @@ async fn file_dispute(
 
     let filer_id = state.identity.node_id();
 
-    // Protection 1: No duplicate disputes on the same request
     if state.storage.has_existing_dispute(&request_id, &filer_id).await? {
         return Err("You have already filed a dispute for this request.".into());
     }
 
-    // Protection 2: Cooldown limit (Max 3 disputes per 15 minutes / 900 seconds)
     if state.storage.check_dispute_rate_limit(&filer_id, 900).await? >= 3 {
         return Err("Rate Limit Exceeded: Cooldown active due to excessive dispute filings.".into());
     }
@@ -288,6 +346,7 @@ async fn file_dispute(
     };
 
     state.storage.file_dispute(&dispute).await?;
+    let _ = state.event_tx.send(format!("DISPUTE_FILED|{}", request_id));
     Ok(Json(serde_json::json!({ "status": "DISPUTE_FILED", "request_id": request_id })))
 }
 
@@ -324,6 +383,7 @@ async fn create_pickup_request(State(state): State<AppState>, Json(payload): Jso
     };
 
     state.storage.create_pickup_request(&request).await?;
+    let _ = state.event_tx.send(format!("NEW_REQUEST|{}", req_id));
     Ok(Json(serde_json::json!({ "status": "REQUEST_CREATED", "request_id": req_id, "state": "PENDING" })))
 }
 
@@ -337,6 +397,7 @@ async fn complete_delivery(State(state): State<AppState>, Path(id): Path<String>
         event_type: format!("DELIVERY_COMPLETED | Notes: {} | PhotoHash: {}", payload.dropoff_notes.unwrap_or_else(|| "None".into()), payload.photo_hash.unwrap_or_else(|| "None".into())),
         timestamp: now,
     }).await?;
+    let _ = state.event_tx.send(format!("DELIVERY_COMPLETED|{}", id));
     Ok(Json(serde_json::json!({ "status": "SUCCESS", "request_id": id, "state": "COMPLETED" })))
 }
 

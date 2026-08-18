@@ -18,3 +18,5 @@ hex = "0.4"
 x25519-dalek = "2.0"
 blake3 = "1.8.6"
 reqwest = { version = "0.13.4", features = ["json"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+futures-util = "0.3.34"

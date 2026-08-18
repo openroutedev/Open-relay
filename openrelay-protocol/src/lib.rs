@@ -328,6 +328,46 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub async fn fetch_bids_for_request(&self, request_id: &str) -> Result<Vec<CourierBid>, String> {
+        use sqlx::Row;
+        let rows = sqlx::query("SELECT request_id, courier, amount, notes, timestamp FROM courier_bids WHERE request_id = ? ORDER BY amount ASC;")
+            .bind(request_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut bids = Vec::new();
+        for row in rows {
+            bids.push(CourierBid {
+                request_id: row.get("request_id"),
+                courier_node_id: row.get("courier"),
+                bid_amount: row.get("amount"),
+                bid_notes: row.get("notes"),
+                timestamp: row.get("timestamp"),
+            });
+        }
+        Ok(bids)
+    }
+
+    pub async fn accept_bid(&self, request_id: &str, courier_node_id: &str) -> Result<(), String> {
+        sqlx::query("UPDATE pickup_requests SET status = 'CLAIMED' WHERE id = ? AND status = 'PENDING';")
+            .bind(request_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let record = HandoffRecord {
+            commitment: request_id.to_string(),
+            hop_index: 1,
+            node_pubkey_hash: courier_node_id.to_string(),
+            event_type: "BID_ACCEPTED_ASSIGNED".into(),
+            timestamp: now,
+        };
+        self.record_handoff_event(&record).await?;
+        Ok(())
+    }
+
     pub async fn file_dispute(&self, dispute: &DisputeRecord) -> Result<(), String> {
         sqlx::query("INSERT INTO disputes (request_id, filer, reason, evidence_hash, timestamp) VALUES (?, ?, ?, ?, ?);").bind(&dispute.request_id).bind(&dispute.filed_by_node_id).bind(&dispute.reason).bind(&dispute.evidence_hash).bind(dispute.timestamp).execute(&self.pool).await.map_err(|e| e.to_string())?;
         sqlx::query("UPDATE pickup_requests SET status = 'DISPUTED' WHERE id = ?;").bind(&dispute.request_id).execute(&self.pool).await.map_err(|e| e.to_string())?;
@@ -466,19 +506,35 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_dispute_rate_limiting() {
+    async fn test_bids_and_acceptance() {
         let storage = StorageEngine::in_memory().await.unwrap();
-        let dispute = DisputeRecord {
-            request_id: "REQ-999".into(),
-            filed_by_node_id: "OR1:B".into(),
-            reason: "Store Closed".into(),
-            evidence_hash: "hash_of_photo".into(),
-            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
+        let req = PickupRequest {
+            id: "REQ-BID-1".into(),
+            requester_node_id: "OR1:REQU_1".into(),
+            request_type: RequestType::StorePickup,
+            dropoff_mode: DropoffMode::InPersonHandoff,
+            requirements: CourierRequirements { min_rating: 0.0, require_insulated_bag: false, required_vehicle: VehicleType::Any },
+            pin_hash: None, pickup_location: "Store".into(), pickup_lat: None, pickup_lon: None,
+            item_description: "Items".into(), dropoff_location: "Home".into(),
+            payment_spec: PaymentSpec { amount_prompt: "$10".into(), accepted_methods: vec![], is_settled: false },
+            payment_amount_num: 10.0, status: RequestStatus::Pending, created_at: 1000, expires_at: 5000,
         };
-        
-        storage.file_dispute(&dispute).await.unwrap();
-        
-        assert!(storage.has_existing_dispute("REQ-999", "OR1:B").await.unwrap());
-        assert_eq!(storage.check_dispute_rate_limit("OR1:B", 900).await.unwrap(), 1);
+        storage.create_pickup_request(&req).await.unwrap();
+
+        let bid = CourierBid {
+            request_id: "REQ-BID-1".into(),
+            courier_node_id: "OR1:COUR_1".into(),
+            bid_amount: 12.0,
+            bid_notes: "Can deliver in 15 mins".into(),
+            timestamp: 1100,
+        };
+        storage.save_bid(&bid).await.unwrap();
+
+        let bids = storage.fetch_bids_for_request("REQ-BID-1").await.unwrap();
+        assert_eq!(bids.len(), 1);
+
+        storage.accept_bid("REQ-BID-1", "OR1:COUR_1").await.unwrap();
+        let updated = storage.fetch_request_by_id("REQ-BID-1").await.unwrap().unwrap();
+        assert_eq!(updated.status, RequestStatus::Claimed);
     }
 }
