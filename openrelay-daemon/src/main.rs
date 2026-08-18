@@ -1,6 +1,8 @@
 use axum::{
-    extract::{Path, Query, State},
-    response::sse::{Event, Sse},
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::{sse::Event, Response, Sse},
     routing::{get, post},
     Json, Router,
 };
@@ -14,7 +16,9 @@ use openrelay_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -25,6 +29,7 @@ struct AppState {
     identity: Arc<NodeIdentity>,
     storage: Arc<StorageEngine>,
     event_tx: broadcast::Sender<String>,
+    rate_limit_count: Arc<AtomicUsize>,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +126,17 @@ struct FileDisputePayload {
     evidence_hash: String,
 }
 
+async fn rate_limit_middleware(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if state.rate_limit_count.fetch_add(1, Ordering::Relaxed) >= 100 {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(request).await)
+}
+
 #[tokio::main]
 async fn main() {
     println!("=== Starting OpenRelay v0.3 Node Daemon ===");
@@ -134,10 +150,22 @@ async fn main() {
 
     let (event_tx, _) = broadcast::channel::<String>(100);
 
+    let rate_limit_count = Arc::new(AtomicUsize::new(0));
+    let counter_clone = rate_limit_count.clone();
+
+    // Background task to reset request counter every 1 second
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            counter_clone.store(0, Ordering::Relaxed);
+        }
+    });
+
     let state = AppState {
         identity: Arc::new(node_identity),
         storage: Arc::new(storage),
         event_tx,
+        rate_limit_count,
     };
 
     let cors = CorsLayer::new()
@@ -162,6 +190,8 @@ async fn main() {
         .route("/v1/shipments/:commitment/history", get(get_shipment_history))
         .route("/v1/requests", post(create_pickup_request).get(query_pickup_requests))
         .route("/v1/requests/:id/complete", post(complete_delivery))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(cors)
         .with_state(state);
 

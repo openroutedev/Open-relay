@@ -271,15 +271,21 @@ impl StorageEngine {
             .await
             .map_err(|e| e.to_string())?;
 
+        // Create Tables
         sqlx::query("CREATE TABLE IF NOT EXISTS shipments (commitment TEXT PRIMARY KEY, state TEXT NOT NULL, seal_serial TEXT NOT NULL, updated_at INTEGER NOT NULL);").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE IF NOT EXISTS pickup_requests (id TEXT PRIMARY KEY, requester TEXT NOT NULL, request_type TEXT NOT NULL, dropoff_mode TEXT NOT NULL, requirements_json TEXT NOT NULL, pin_hash TEXT, pickup_location TEXT NOT NULL, pickup_lat REAL, pickup_lon REAL, item_description TEXT NOT NULL, dropoff_location TEXT NOT NULL, payment_json TEXT NOT NULL, payment_amount_num REAL NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE IF NOT EXISTS peers (node_id TEXT PRIMARY KEY, endpoint_url TEXT NOT NULL, last_seen INTEGER NOT NULL);").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE IF NOT EXISTS seen_gossip (msg_id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE IF NOT EXISTS handoff_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, commitment TEXT NOT NULL, hop_index INTEGER NOT NULL, node_pubkey_hash TEXT NOT NULL, event_type TEXT NOT NULL, timestamp INTEGER NOT NULL);").execute(&pool).await.unwrap();
-        
         sqlx::query("CREATE TABLE IF NOT EXISTS node_ratings (id INTEGER PRIMARY KEY AUTOINCREMENT, rater TEXT NOT NULL, subject TEXT NOT NULL, score REAL NOT NULL, review_notes TEXT NOT NULL, timestamp INTEGER NOT NULL);").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE IF NOT EXISTS courier_bids (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, courier TEXT NOT NULL, amount REAL NOT NULL, notes TEXT NOT NULL, timestamp INTEGER NOT NULL);").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE IF NOT EXISTS disputes (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, filer TEXT NOT NULL, reason TEXT NOT NULL, evidence_hash TEXT NOT NULL, timestamp INTEGER NOT NULL);").execute(&pool).await.unwrap();
+
+        // Feature A: High-Performance Database Indexes
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_requests_status ON pickup_requests(status);").execute(&pool).await.unwrap();
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_requests_expires ON pickup_requests(expires_at);").execute(&pool).await.unwrap();
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_shipments_state ON shipments(state);").execute(&pool).await.unwrap();
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_handoff_commitment ON handoff_logs(commitment);").execute(&pool).await.unwrap();
 
         Ok(Self { pool })
     }
