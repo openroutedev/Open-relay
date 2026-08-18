@@ -128,8 +128,9 @@ async fn main() {
     let node_identity = NodeIdentity::generate();
     println!("[+] Node ID: {}", node_identity.node_id());
 
-    let storage = StorageEngine::in_memory().await.expect("Failed to init storage");
-    println!("[+] SQLite storage initialized");
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://openrelay.db?mode=rwc".to_string());
+    let storage = StorageEngine::connect(&db_url).await.expect("Failed to init storage");
+    println!("[+] SQLite persistent storage connected: {}", db_url);
 
     let (event_tx, _) = broadcast::channel::<String>(100);
 
@@ -152,6 +153,7 @@ async fn main() {
         .route("/v1/pricing/estimate", get(pricing_estimate))
         .route("/v1/nodes/:id/rate", post(submit_rating))
         .route("/v1/requests/:id", get(get_single_request))
+        .route("/v1/requests/:id/cancel", post(cancel_pickup_request))
         .route("/v1/requests/:id/bids", get(get_request_bids).post(submit_bid))
         .route("/v1/requests/:id/accept_bid", post(accept_bid))
         .route("/v1/requests/:id/dispute", post(file_dispute))
@@ -195,6 +197,15 @@ async fn get_single_request(
         .await?
         .ok_or_else(|| "Request not found".to_string())?;
     Ok(Json(request))
+}
+
+async fn cancel_pickup_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, String> {
+    state.storage.cancel_request(&id).await?;
+    let _ = state.event_tx.send(format!("REQUEST_CANCELLED|{}", id));
+    Ok(Json(serde_json::json!({ "status": "REQUEST_CANCELLED", "request_id": id })))
 }
 
 async fn get_request_bids(

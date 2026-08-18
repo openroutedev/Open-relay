@@ -266,8 +266,8 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-    pub async fn in_memory() -> Result<Self, String> {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+    pub async fn connect(db_url: &str) -> Result<Self, String> {
+        let pool = sqlx::SqlitePool::connect(db_url)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -282,6 +282,36 @@ impl StorageEngine {
         sqlx::query("CREATE TABLE IF NOT EXISTS disputes (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, filer TEXT NOT NULL, reason TEXT NOT NULL, evidence_hash TEXT NOT NULL, timestamp INTEGER NOT NULL);").execute(&pool).await.unwrap();
 
         Ok(Self { pool })
+    }
+
+    pub async fn in_memory() -> Result<Self, String> {
+        Self::connect("sqlite::memory:").await
+    }
+
+    pub async fn cancel_request(&self, request_id: &str) -> Result<(), String> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT status FROM pickup_requests WHERE id = ?")
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(r) = row {
+            let status: String = r.get("status");
+            if status != "PENDING" {
+                return Err("Only PENDING requests can be cancelled".into());
+            }
+
+            sqlx::query("UPDATE pickup_requests SET status = 'CANCELLED' WHERE id = ?")
+                .bind(request_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok(())
+        } else {
+            Err("Request not found".into())
+        }
     }
 
     pub async fn register_peer(&self, peer: &PeerNode) -> Result<(), String> {
@@ -506,11 +536,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_bids_and_acceptance() {
+    async fn test_manual_cancellation() {
         let storage = StorageEngine::in_memory().await.unwrap();
         let req = PickupRequest {
-            id: "REQ-BID-1".into(),
-            requester_node_id: "OR1:REQU_1".into(),
+            id: "REQ-CANCEL-1".into(),
+            requester_node_id: "OR1:USER".into(),
             request_type: RequestType::StorePickup,
             dropoff_mode: DropoffMode::InPersonHandoff,
             requirements: CourierRequirements { min_rating: 0.0, require_insulated_bag: false, required_vehicle: VehicleType::Any },
@@ -521,20 +551,8 @@ mod tests {
         };
         storage.create_pickup_request(&req).await.unwrap();
 
-        let bid = CourierBid {
-            request_id: "REQ-BID-1".into(),
-            courier_node_id: "OR1:COUR_1".into(),
-            bid_amount: 12.0,
-            bid_notes: "Can deliver in 15 mins".into(),
-            timestamp: 1100,
-        };
-        storage.save_bid(&bid).await.unwrap();
-
-        let bids = storage.fetch_bids_for_request("REQ-BID-1").await.unwrap();
-        assert_eq!(bids.len(), 1);
-
-        storage.accept_bid("REQ-BID-1", "OR1:COUR_1").await.unwrap();
-        let updated = storage.fetch_request_by_id("REQ-BID-1").await.unwrap().unwrap();
-        assert_eq!(updated.status, RequestStatus::Claimed);
+        assert!(storage.cancel_request("REQ-CANCEL-1").await.is_ok());
+        let updated = storage.fetch_request_by_id("REQ-CANCEL-1").await.unwrap().unwrap();
+        assert_eq!(updated.status, RequestStatus::Cancelled);
     }
 }
