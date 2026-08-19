@@ -10,9 +10,10 @@ use futures_util::stream::Stream;
 use openrelay_crypto::identity::NodeIdentity;
 use openrelay_label::{format::PackageLabelData, pdf::PackingSlipGenerator};
 use openrelay_protocol::{
-    hash_pin, haversine_km, CourierBid, CourierRequirements, DisputeRecord, DropoffMode,
-    GossipMessage, HandoffRecord, NodeRating, PaymentSpec, PeerNode, PickupRequest, RequestStatus,
-    RequestType, ShipmentState, StorageEngine, VehicleType,
+    encrypt_e2ee_message, generate_pseudonym, hash_pin, haversine_km, CourierBid, CourierPresence,
+    CourierRequirements, DisputeRecord, DropoffMode, EncryptedMessage, GossipMessage, HandoffRecord,
+    NodeRating, PaymentSpec, PeerNode, PickupRequest, RequestStatus, RequestType, ShipmentState,
+    StagingHub, StorageEngine, VehicleType,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -53,6 +54,9 @@ struct CreateShipmentRequest {
 
 #[derive(Deserialize)]
 struct CreatePickupOrderPayload {
+    target_courier_id: Option<String>,
+    staging_hub_id: Option<String>,
+    hub_fee_num: Option<f64>,
     request_type: Option<String>,
     dropoff_mode: Option<String>,
     verification_pin: Option<String>,
@@ -79,6 +83,51 @@ struct CompleteDeliveryPayload {
 #[derive(Deserialize)]
 struct AcceptBidPayload {
     courier_node_id: String,
+}
+
+#[derive(Deserialize)]
+struct SendMessagePayload {
+    request_id: Option<String>,
+    recipient_node_id: String,
+    recipient_x25519_pk_hex: String,
+    plaintext: String,
+}
+
+#[derive(Deserialize)]
+struct PresenceHeartbeatPayload {
+    username: Option<String>,
+    x25519_pubkey_hex: String,
+    lat: f64,
+    lon: f64,
+    is_online: bool,
+}
+
+#[derive(Deserialize)]
+struct ConfirmSettlementPayload {
+    is_requester: bool,
+}
+
+#[derive(Deserialize)]
+struct RegisterHubPayload {
+    name: String,
+    address: String,
+    lat: f64,
+    lon: f64,
+    hub_fee_num: f64,
+    capacity: i32,
+}
+
+#[derive(Deserialize)]
+struct MapLinksQuery {
+    lat: f64,
+    lon: f64,
+}
+
+#[derive(Deserialize)]
+struct OnlineCouriersQuery {
+    user_lat: f64,
+    user_lon: f64,
+    max_dist_km: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -149,11 +198,9 @@ async fn main() {
     println!("[+] SQLite persistent storage connected: {}", db_url);
 
     let (event_tx, _) = broadcast::channel::<String>(100);
-
     let rate_limit_count = Arc::new(AtomicUsize::new(0));
-    let counter_clone = rate_limit_count.clone();
 
-    // Background task to reset request counter every 1 second
+    let counter_clone = rate_limit_count.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -168,20 +215,24 @@ async fn main() {
         rate_limit_count,
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
     let app = Router::new()
         .route("/v1/status", get(get_status))
         .route("/v1/events", get(sse_events_handler))
+        .route("/v1/identity/pseudonym", get(get_random_pseudonym))
+        .route("/v1/navigation/links", get(get_navigation_links))
+        .route("/v1/messages", post(send_encrypted_message).get(fetch_encrypted_messages))
+        .route("/v1/presence", post(presence_heartbeat))
+        .route("/v1/couriers/online", get(get_online_couriers))
+        .route("/v1/hubs", post(register_staging_hub).get(get_nearby_hubs))
         .route("/v1/peers", get(get_peers).post(register_peer))
         .route("/v1/gossip/broadcast", post(receive_gossip))
         .route("/v1/pricing/estimate", get(pricing_estimate))
         .route("/v1/nodes/:id/rate", post(submit_rating))
         .route("/v1/requests/:id", get(get_single_request))
         .route("/v1/requests/:id/cancel", post(cancel_pickup_request))
+        .route("/v1/requests/:id/confirm", post(confirm_settlement))
         .route("/v1/requests/:id/bids", get(get_request_bids).post(submit_bid))
         .route("/v1/requests/:id/accept_bid", post(accept_bid))
         .route("/v1/requests/:id/dispute", post(file_dispute))
@@ -206,6 +257,116 @@ async fn get_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ACTIVE_ONLINE", "version": "0.3.0", "node_id": state.identity.node_id() }))
 }
 
+async fn get_random_pseudonym() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "pseudonym": generate_pseudonym() }))
+}
+
+async fn get_navigation_links(Query(query): Query<MapLinksQuery>) -> Json<serde_json::Value> {
+    let google = format!("https://www.google.com/maps/dir/?api=1&destination={},{}", query.lat, query.lon);
+    let apple = format!("https://maps.apple.com/?daddr={},{}", query.lat, query.lon);
+    let waze = format!("https://waze.com/ul?ll={},{}&navigate=yes", query.lat, query.lon);
+    let osm = format!("https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=;{},{}", query.lat, query.lon);
+
+    Json(serde_json::json!({
+        "coordinates": { "lat": query.lat, "lon": query.lon },
+        "links": { "google_maps": google, "apple_maps": apple, "waze": waze, "openstreetmap": osm }
+    }))
+}
+
+async fn send_encrypted_message(
+    State(state): State<AppState>,
+    Json(payload): Json<SendMessagePayload>,
+) -> Result<Json<serde_json::Value>, String> {
+    let (eph_pk_hex, nonce_hex, cipher_hex, mac_tag_hex) = encrypt_e2ee_message(&payload.recipient_x25519_pk_hex, payload.plaintext.as_bytes())?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let msg_id = format!("MSG-{}", &hex::encode(blake3::hash(cipher_hex.as_bytes()).as_bytes())[..8]);
+
+    let message = EncryptedMessage {
+        id: msg_id.clone(), request_id: payload.request_id, sender_node_id: state.identity.node_id(),
+        recipient_node_id: payload.recipient_node_id.clone(), ephemeral_pubkey_hex: eph_pk_hex,
+        nonce_hex, ciphertext_hex: cipher_hex, mac_tag_hex, timestamp: now,
+    };
+
+    state.storage.save_chat_message(&message).await?;
+    let _ = state.event_tx.send(format!("NEW_MESSAGE|{}", payload.recipient_node_id));
+    Ok(Json(serde_json::json!({ "status": "MESSAGE_SENT", "msg_id": msg_id })))
+}
+
+async fn fetch_encrypted_messages(
+    State(state): State<AppState>,
+    Query(filter): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<EncryptedMessage>>, String> {
+    let req_id = filter.get("request_id").map(|s| s.as_str());
+    let msgs = state.storage.fetch_messages(&state.identity.node_id(), req_id).await?;
+    Ok(Json(msgs))
+}
+
+async fn presence_heartbeat(
+    State(state): State<AppState>,
+    Json(payload): Json<PresenceHeartbeatPayload>,
+) -> Result<Json<serde_json::Value>, String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let username = payload.username.unwrap_or_else(generate_pseudonym);
+
+    let presence = CourierPresence {
+        courier_node_id: state.identity.node_id(), username, x25519_pubkey_hex: payload.x25519_pubkey_hex,
+        lat: payload.lat, lon: payload.lon, is_online: payload.is_online, last_ping: now,
+    };
+
+    state.storage.update_courier_presence(&presence).await?;
+    Ok(Json(serde_json::json!({ "status": "PRESENCE_UPDATED", "is_online": payload.is_online })))
+}
+
+async fn get_online_couriers(
+    State(state): State<AppState>,
+    Query(query): Query<OnlineCouriersQuery>,
+) -> Result<Json<Vec<CourierPresence>>, String> {
+    let max_dist = query.max_dist_km.unwrap_or(25.0);
+    let couriers = state.storage.fetch_online_couriers(query.user_lat, query.user_lon, max_dist).await?;
+    Ok(Json(couriers))
+}
+
+async fn confirm_settlement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ConfirmSettlementPayload>,
+) -> Result<Json<serde_json::Value>, String> {
+    let (req_conf, cour_conf) = state.storage.confirm_settlement(&id, payload.is_requester).await?;
+    let fully_settled = req_conf && cour_conf;
+    let _ = state.event_tx.send(format!("SETTLEMENT_UPDATE|{}|{}", id, fully_settled));
+
+    Ok(Json(serde_json::json!({
+        "status": if fully_settled { "FULLY_SETTLED_COMPLETED" } else { "CONFIRMATION_LOGGED_WAITING_OTHER_PARTY" },
+        "requester_confirmed": req_conf,
+        "courier_confirmed": cour_conf
+    })))
+}
+
+async fn register_staging_hub(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterHubPayload>,
+) -> Result<Json<serde_json::Value>, String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let hub_id = format!("HUB-{}", &hex::encode(blake3::hash(payload.name.as_bytes()).as_bytes())[..8]);
+
+    let hub = StagingHub {
+        hub_id: hub_id.clone(), operator_node_id: state.identity.node_id(), name: payload.name, address: payload.address,
+        lat: payload.lat, lon: payload.lon, hub_fee_num: payload.hub_fee_num, holding_capacity: payload.capacity, created_at: now,
+    };
+
+    state.storage.register_staging_hub(&hub).await?;
+    Ok(Json(serde_json::json!({ "status": "HUB_REGISTERED", "hub_id": hub_id })))
+}
+
+async fn get_nearby_hubs(
+    State(state): State<AppState>,
+    Query(query): Query<OnlineCouriersQuery>,
+) -> Result<Json<Vec<StagingHub>>, String> {
+    let max_dist = query.max_dist_km.unwrap_or(50.0);
+    let hubs = state.storage.fetch_nearby_hubs(query.user_lat, query.user_lon, max_dist).await?;
+    Ok(Json(hubs))
+}
+
 async fn sse_events_handler(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
@@ -221,11 +382,7 @@ async fn get_single_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<PickupRequest>, String> {
-    let request = state
-        .storage
-        .fetch_request_by_id(&id)
-        .await?
-        .ok_or_else(|| "Request not found".to_string())?;
+    let request = state.storage.fetch_request_by_id(&id).await?.ok_or_else(|| "Request not found".to_string())?;
     Ok(Json(request))
 }
 
@@ -252,8 +409,7 @@ async fn accept_bid(
     Json(payload): Json<AcceptBidPayload>,
 ) -> Result<Json<serde_json::Value>, String> {
     state.storage.accept_bid(&id, &payload.courier_node_id).await?;
-    let event_msg = format!("BID_ACCEPTED|{}|{}", id, payload.courier_node_id);
-    let _ = state.event_tx.send(event_msg);
+    let _ = state.event_tx.send(format!("BID_ACCEPTED|{}|{}", id, payload.courier_node_id));
     Ok(Json(serde_json::json!({ "status": "BID_ACCEPTED", "request_id": id, "courier": payload.courier_node_id })))
 }
 
@@ -315,11 +471,8 @@ async fn submit_rating(
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
     let rating = NodeRating {
-        rater_node_id: state.identity.node_id(),
-        subject_node_id: subject_id.clone(),
-        score: payload.score,
-        review_notes: payload.review_notes,
-        timestamp: now,
+        rater_node_id: state.identity.node_id(), subject_node_id: subject_id.clone(),
+        score: payload.score, review_notes: payload.review_notes, timestamp: now,
     };
 
     state.storage.save_rating(&rating).await?;
@@ -331,8 +484,7 @@ async fn submit_bid(
     Path(request_id): Path<String>,
     Json(payload): Json<SubmitBidPayload>,
 ) -> Result<Json<serde_json::Value>, String> {
-    let req = state.storage.fetch_request_by_id(&request_id).await?
-        .ok_or("Pickup Request not found")?;
+    let req = state.storage.fetch_request_by_id(&request_id).await?.ok_or("Pickup Request not found")?;
 
     if req.status != RequestStatus::Pending {
         return Err("Cannot bid on a task that is not pending".into());
@@ -345,11 +497,8 @@ async fn submit_bid(
 
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let bid = CourierBid {
-        request_id: request_id.clone(),
-        courier_node_id: state.identity.node_id(),
-        bid_amount: payload.bid_amount,
-        bid_notes: payload.bid_notes,
-        timestamp: now,
+        request_id: request_id.clone(), courier_node_id: state.identity.node_id(),
+        bid_amount: payload.bid_amount, bid_notes: payload.bid_notes, timestamp: now,
     };
 
     state.storage.save_bid(&bid).await?;
@@ -379,11 +528,8 @@ async fn file_dispute(
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     
     let dispute = DisputeRecord {
-        request_id: request_id.clone(),
-        filed_by_node_id: filer_id,
-        reason: payload.reason,
-        evidence_hash: payload.evidence_hash,
-        timestamp: now,
+        request_id: request_id.clone(), filed_by_node_id: filer_id, reason: payload.reason,
+        evidence_hash: payload.evidence_hash, timestamp: now,
     };
 
     state.storage.file_dispute(&dispute).await?;
@@ -409,6 +555,7 @@ async fn create_pickup_request(State(state): State<AppState>, Json(payload): Jso
     
     let request = PickupRequest {
         id: req_id.clone(), requester_node_id: state.identity.node_id(),
+        target_courier_id: payload.target_courier_id, staging_hub_id: payload.staging_hub_id, hub_fee_num: payload.hub_fee_num,
         request_type: RequestType::from_str(payload.request_type.as_deref().unwrap_or("CUSTOM_TASK")),
         dropoff_mode: DropoffMode::from_str(payload.dropoff_mode.as_deref().unwrap_or("IN_PERSON_HANDOFF")),
         requirements: CourierRequirements {
@@ -420,6 +567,7 @@ async fn create_pickup_request(State(state): State<AppState>, Json(payload): Jso
         pickup_location: payload.pickup_location, pickup_lat: payload.pickup_lat, pickup_lon: payload.pickup_lon,
         item_description: payload.item_description, dropoff_location: payload.dropoff_location,
         payment_spec: payload.payment_spec, payment_amount_num: payload.payment_amount_num,
+        requester_confirmed: false, courier_confirmed: false,
         status: RequestStatus::Pending, created_at: now, expires_at,
     };
 
