@@ -10,9 +10,9 @@ use futures_util::stream::Stream;
 use openrelay_crypto::identity::NodeIdentity;
 use openrelay_label::{format::PackageLabelData, pdf::PackingSlipGenerator};
 use openrelay_protocol::{
-    encrypt_e2ee_message, generate_pseudonym, hash_pin, haversine_km, CourierBid, CourierPresence,
-    CourierRequirements, DisputeRecord, DropoffMode, EncryptedMessage, GossipMessage, HandoffRecord,
-    NodeRating, PaymentSpec, PeerNode, PickupRequest, RequestStatus, RequestType, ShipmentState,
+    decrypt_e2ee_message, encrypt_e2ee_message, generate_pseudonym, hash_pin, haversine_km, CourierBid,
+    CourierPresence, CourierRequirements, DisputeRecord, DropoffMode, EncryptedMessage, GossipMessage,
+    HandoffRecord, NodeRating, PaymentSpec, PeerNode, PickupRequest, RequestStatus, RequestType, ShipmentState,
     StagingHub, StorageEngine, VehicleType,
 };
 use serde::{Deserialize, Serialize};
@@ -24,10 +24,14 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::{Any, CorsLayer};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 #[derive(Clone)]
 struct AppState {
     identity: Arc<NodeIdentity>,
+    x25519_sk_bytes: Arc<[u8; 32]>,
+    x25519_pubkey_hex: String,
+    node_pseudonym: String,
     storage: Arc<StorageEngine>,
     event_tx: broadcast::Sender<String>,
     rate_limit_count: Arc<AtomicUsize>,
@@ -94,9 +98,27 @@ struct SendMessagePayload {
 }
 
 #[derive(Deserialize)]
+struct DecryptMessagePayload {
+    ephemeral_pubkey_hex: String,
+    nonce_hex: String,
+    ciphertext_hex: String,
+    mac_tag_hex: String,
+}
+
+#[derive(Serialize)]
+struct DecryptedMessageResponse {
+    id: String,
+    request_id: Option<String>,
+    sender_node_id: String,
+    recipient_node_id: String,
+    plaintext: String,
+    timestamp: i64,
+}
+
+#[derive(Deserialize)]
 struct PresenceHeartbeatPayload {
     username: Option<String>,
-    x25519_pubkey_hex: String,
+    x25519_pubkey_hex: Option<String>,
     lat: f64,
     lon: f64,
     is_online: bool,
@@ -193,6 +215,18 @@ async fn main() {
     let node_identity = NodeIdentity::generate();
     println!("[+] Node ID: {}", node_identity.node_id());
 
+    // Generate local static X25519 keypair for E2EE
+    let mut x25519_sk_bytes = [0u8; 32];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut x25519_sk_bytes);
+    let x25519_sk = X25519StaticSecret::from(x25519_sk_bytes);
+    let x25519_pk = X25519PublicKey::from(&x25519_sk);
+    let x25519_pubkey_hex = hex::encode(x25519_pk.as_bytes());
+    let node_pseudonym = generate_pseudonym();
+
+    println!("[+] X25519 Public Key: {}", x25519_pubkey_hex);
+    println!("[+] Default Session Pseudonym: {}", node_pseudonym);
+
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://openrelay.db?mode=rwc".to_string());
     let storage = StorageEngine::connect(&db_url).await.expect("Failed to init storage");
     println!("[+] SQLite persistent storage connected: {}", db_url);
@@ -210,6 +244,9 @@ async fn main() {
 
     let state = AppState {
         identity: Arc::new(node_identity),
+        x25519_sk_bytes: Arc::new(x25519_sk_bytes),
+        x25519_pubkey_hex,
+        node_pseudonym,
         storage: Arc::new(storage),
         event_tx,
         rate_limit_count,
@@ -223,6 +260,8 @@ async fn main() {
         .route("/v1/identity/pseudonym", get(get_random_pseudonym))
         .route("/v1/navigation/links", get(get_navigation_links))
         .route("/v1/messages", post(send_encrypted_message).get(fetch_encrypted_messages))
+        .route("/v1/messages/decrypted", get(fetch_auto_decrypted_messages))
+        .route("/v1/messages/decrypt", post(decrypt_single_message))
         .route("/v1/presence", post(presence_heartbeat))
         .route("/v1/couriers/online", get(get_online_couriers))
         .route("/v1/hubs", post(register_staging_hub).get(get_nearby_hubs))
@@ -254,7 +293,13 @@ async fn main() {
 }
 
 async fn get_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ACTIVE_ONLINE", "version": "0.3.0", "node_id": state.identity.node_id() }))
+    Json(serde_json::json!({
+        "status": "ACTIVE_ONLINE",
+        "version": "0.3.0",
+        "node_id": state.identity.node_id(),
+        "x25519_pubkey_hex": state.x25519_pubkey_hex,
+        "default_pseudonym": state.node_pseudonym
+    }))
 }
 
 async fn get_random_pseudonym() -> Json<serde_json::Value> {
@@ -292,6 +337,21 @@ async fn send_encrypted_message(
     Ok(Json(serde_json::json!({ "status": "MESSAGE_SENT", "msg_id": msg_id })))
 }
 
+async fn decrypt_single_message(
+    State(state): State<AppState>,
+    Json(payload): Json<DecryptMessagePayload>,
+) -> Result<Json<serde_json::Value>, String> {
+    let decrypted_bytes = decrypt_e2ee_message(
+        &state.x25519_sk_bytes,
+        &payload.ephemeral_pubkey_hex,
+        &payload.nonce_hex,
+        &payload.ciphertext_hex,
+        &payload.mac_tag_hex,
+    )?;
+    let plaintext = String::from_utf8(decrypted_bytes).map_err(|e| e.to_string())?;
+    Ok(Json(serde_json::json!({ "plaintext": plaintext })))
+}
+
 async fn fetch_encrypted_messages(
     State(state): State<AppState>,
     Query(filter): Query<std::collections::HashMap<String, String>>,
@@ -301,15 +361,47 @@ async fn fetch_encrypted_messages(
     Ok(Json(msgs))
 }
 
+async fn fetch_auto_decrypted_messages(
+    State(state): State<AppState>,
+    Query(filter): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<DecryptedMessageResponse>>, String> {
+    let req_id = filter.get("request_id").map(|s| s.as_str());
+    let raw_msgs = state.storage.fetch_messages(&state.identity.node_id(), req_id).await?;
+    
+    let mut decrypted_list = Vec::new();
+    for msg in raw_msgs {
+        if let Ok(decrypted_bytes) = decrypt_e2ee_message(
+            &state.x25519_sk_bytes,
+            &msg.ephemeral_pubkey_hex,
+            &msg.nonce_hex,
+            &msg.ciphertext_hex,
+            &msg.mac_tag_hex,
+        ) {
+            if let Ok(plaintext) = String::from_utf8(decrypted_bytes) {
+                decrypted_list.push(DecryptedMessageResponse {
+                    id: msg.id,
+                    request_id: msg.request_id,
+                    sender_node_id: msg.sender_node_id,
+                    recipient_node_id: msg.recipient_node_id,
+                    plaintext,
+                    timestamp: msg.timestamp,
+                });
+            }
+        }
+    }
+    Ok(Json(decrypted_list))
+}
+
 async fn presence_heartbeat(
     State(state): State<AppState>,
     Json(payload): Json<PresenceHeartbeatPayload>,
 ) -> Result<Json<serde_json::Value>, String> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    let username = payload.username.unwrap_or_else(generate_pseudonym);
+    let username = payload.username.unwrap_or_else(|| state.node_pseudonym.clone());
+    let pubkey = payload.x25519_pubkey_hex.unwrap_or_else(|| state.x25519_pubkey_hex.clone());
 
     let presence = CourierPresence {
-        courier_node_id: state.identity.node_id(), username, x25519_pubkey_hex: payload.x25519_pubkey_hex,
+        courier_node_id: state.identity.node_id(), username, x25519_pubkey_hex: pubkey,
         lat: payload.lat, lon: payload.lon, is_online: payload.is_online, last_ping: now,
     };
 

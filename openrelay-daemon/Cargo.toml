@@ -21,3 +21,4 @@ reqwest = { version = "0.13.4", features = ["json"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 futures-util = "0.3.34"
 tower = { version = "0.5.3", features = ["limit"] }
+rand = { version = "0.8", features = ["std"] }
