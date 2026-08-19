@@ -6,3 +6,4 @@
 manifest.pdf
 .DS_Store
 .env
+node_identity.json
